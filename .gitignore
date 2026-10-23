@@ -1,0 +1,44 @@
+# ---- 依赖 ----
+node_modules/
+
+# ---- 构建产物 / 打包文件 ----
+/dist/
+*.zip
+*.tsbuildinfo
+
+# ---- 本地配置与密钥 ----
+/.env
+/.env.*
+!/.env.example
+/providers.json
+*.pem
+*.key
+
+# ---- 运行时数据（按租户隔离，含个人文档/向量）----
+/data/
+/skills/*
+!/skills/_defaults/
+
+# ---- 日志与临时文件 ----
+*.log
+npm-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+*.tmp
+*.temp
+
+# ---- 缓存 ----
+/.vite/
+/.cache/
+/coverage/
+/.nyc_output/
+.eslintcache
+
+# ---- 编辑器 / 系统 ----
+/.idea/
+/.vscode/
+.DS_Store
+Thumbs.db
+desktop.ini
+*.swp
+*~
