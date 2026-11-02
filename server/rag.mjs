@@ -65,34 +65,109 @@ export function flushRag() {
 
 /* ---------------- 切块 ---------------- */
 
+/** 句末/换行边界；英文句点、问号、感叹号、分号、中文标点都算 */
+const BOUNDARY = /[。！？!?；;.\n]/;
+
+/**
+ * 把一个超长段落切成不超过 size 的片段。
+ * 优先在句末/换行处切，其次在空白处切，最后才硬切。
+ * 这里产出的片段互不重叠，overlap 由调用方统一添加一次。
+ */
+function splitLong(text, size) {
+  const out = [];
+  let rest = text;
+  const minCut = Math.floor(size * 0.6);
+
+  while (rest.length > size) {
+    const head = rest.slice(0, size);
+    let cut = -1;
+
+    // 1) 句末 / 换行：从后往前找，尽量切在完整句子后
+    for (let i = head.length - 1; i >= minCut; i--) {
+      if (BOUNDARY.test(head[i])) {
+        cut = i + 1;
+        break;
+      }
+    }
+
+    // 2) 空白：英文单词、代码行
+    if (cut < 0) {
+      for (let i = head.length - 1; i >= minCut; i--) {
+        if (/\s/.test(head[i])) {
+          cut = i + 1;
+          break;
+        }
+      }
+    }
+
+    // 3) 没有任何边界（例如超长无标点中文/代码），只能硬切
+    if (cut < 0) cut = size;
+
+    const piece = rest.slice(0, cut).trimEnd();
+    if (piece) out.push(piece);
+    rest = rest.slice(cut);
+  }
+
+  const tail = rest.trim();
+  if (tail) out.push(tail);
+  return out;
+}
+
+/**
+ * 取上一块尾部作为 overlap。
+ * 如果尾部从单词/句子中间开始，尽量向后挪到最近的边界，
+ * 避免参考资料一打开就是 "ct，ref..." 这种断词。
+ */
+function overlapTail(text, max) {
+  if (!max) return '';
+  const tail = text.slice(-max);
+  for (let i = 0; i < tail.length; i++) {
+    if (BOUNDARY.test(tail[i]) || /\s/.test(tail[i])) {
+      const start = i + 1;
+      // 边界太靠后就不截了，否则 overlap 会几乎消失
+      if (tail.length - start >= 20) return tail.slice(start).trimStart();
+      break;
+    }
+  }
+  return tail;
+}
+
 export function chunkText(text, { size = 600, overlap = 100 } = {}) {
   const clean = text.replace(/\r\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim();
   if (!clean) return [];
 
   const paras = clean.split(/\n\s*\n/).map((p) => p.trim()).filter(Boolean);
-  const chunks = [];
+  const raw = [];
   let buf = '';
 
   for (const p of paras) {
-    if ((buf + '\n\n' + p).length <= size) {
-      buf = buf ? `${buf}\n\n${p}` : p;
+    // 单段超长：先 flush 当前缓冲，再按边界切
+    if (p.length > size) {
+      if (buf) {
+        raw.push(buf);
+        buf = '';
+      }
+      raw.push(...splitLong(p, size));
       continue;
     }
-    if (buf) chunks.push(buf);
-    if (p.length <= size) {
+
+    if (!buf) {
       buf = p;
+      continue;
+    }
+
+    if (buf.length + 2 + p.length <= size) {
+      buf = `${buf}\n\n${p}`;
     } else {
-      for (let i = 0; i < p.length; i += size - overlap) {
-        const piece = p.slice(i, i + size);
-        if (piece.trim()) chunks.push(piece);
-        if (i + size >= p.length) break;
-      }
-      buf = '';
+      raw.push(buf);
+      buf = p;
     }
   }
-  if (buf.trim()) chunks.push(buf);
+  if (buf.trim()) raw.push(buf);
 
-  return chunks.map((c, i) => (i === 0 ? c : `${chunks[i - 1].slice(-overlap)}\n${c}`));
+  // overlap 只在最后加一次：取上一块尾部，不参与切分
+  const step = Math.max(0, Math.min(overlap, Math.floor(size / 2)));
+  return raw.map((c, i) => (i === 0 || !step ? c : `${overlapTail(raw[i - 1], step)}\n${c}`));
 }
 
 /* ---------------- 向量化 ---------------- */

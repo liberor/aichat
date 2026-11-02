@@ -324,7 +324,14 @@ export async function callMcpTool(tenant, fullName, args) {
     s.activeCalls = (s.activeCalls || 0) + 1;
     try {
       const result = await s.client.callTool({ name: tool.originalName, arguments: args });
-      return flatten(result);
+      const text = flatten(result);
+
+      // MCP 用 isError 表示工具执行失败；当成成功回填会让卡片显示“完成”
+      if (result?.isError) {
+        throw new Error(text || `${fullName} 执行失败`);
+      }
+
+      return text;
     } finally {
       s.activeCalls = Math.max(0, (s.activeCalls || 1) - 1);
     }
@@ -332,7 +339,8 @@ export async function callMcpTool(tenant, fullName, args) {
   throw new Error(`未找到 MCP 工具: ${fullName}`);
 }
 
-function flatten(result) {
+/** 把 MCP 的 content 数组拼成纯文本；导出是为了单测 isError 分支 */
+export function flatten(result) {
   const parts = result?.content || [];
   return parts
     .map((p) => (p.type === 'text' ? p.text : `[${p.type}]`))

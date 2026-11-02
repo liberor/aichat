@@ -16,6 +16,8 @@ export interface ToolCall {
   /** 客户端收到 tool_call 的时间，用于显示已等待时长 */
   startedAt?: number;
   finishedAt?: number;
+  /** 用户主动停止时标记，卡片显示「已中断」而不是「失败」 */
+  interrupted?: boolean;
 }
 
 /** assistant 消息的有序内容：文字块或工具引用 */

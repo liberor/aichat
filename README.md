@@ -145,7 +145,7 @@ TRUST_PROXY=false             # 同机反代 loopback；一跳远程反代 1
   - 不要在生产用 `TRUST_PROXY=true`
 - 只在反代后面时建议 `HOST=127.0.0.1`，公网只开放反代端口
 - 前端首次打开要求输入访问码，通过后写入 HttpOnly cookie（EventSource 也能带上）
-- 服务端也接受 `X-Access-Code` 头，方便脚本调用
+- 服务端也接受 `X-Access-Code` 头，方便脚本调用；它和登录共用失败计数，连续错误同样会锁定该 IP
 - 登录失败单独计数：连续输错 `AUTH_MAX_FAILS`（默认 10）次后锁定该 IP `AUTH_LOCK_MINUTES`（默认 15）分钟，失败响应另有 200ms 固定延迟
 - 超限返回 429（带 `Retry-After`）
 - 只设一个码时，用这个码的人共享同一空间

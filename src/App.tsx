@@ -110,9 +110,13 @@ export default function App() {
   const esRef = useRef<EventSource | null>(null);
   const convsRef = useRef<Conv[]>([]);
   const currentIdRef = useRef('');
-  const sendingRef = useRef(false);
+  // 当前正在 POST 的请求号，0 = 空闲。用序号而不是布尔：旧请求返回时不能解除新请求的锁
+  const sendingRef = useRef(0);
+  const sendSeqRef = useRef(0);
   const mcpAutoRef = useRef(false);
   const saveTimers = useRef<Record<string, number>>({});
+  // 已删除的会话：迟到的 debounce / flush 不能把它们重新写回 IndexedDB
+  const deletedRef = useRef<Set<string>>(new Set());
   const messagesRef = useRef<HTMLDivElement | null>(null);
   const stickRef = useRef(true);
   const lastScrollTopRef = useRef(0);
@@ -354,10 +358,14 @@ export default function App() {
   function persist(conv: Conv, immediate = false) {
     clearTimeout(saveTimers.current[conv.id]);
     if (immediate) {
-      putConv(conv).catch(() => {});
+      if (!deletedRef.current.has(conv.id)) putConv(conv).catch(() => {});
       return;
     }
-    saveTimers.current[conv.id] = window.setTimeout(() => putConv(conv).catch(() => {}), 400);
+    saveTimers.current[conv.id] = window.setTimeout(() => {
+      // 定时器可能在删除之后才触发，落盘前再确认一次
+      if (deletedRef.current.has(conv.id)) return;
+      putConv(conv).catch(() => {});
+    }, 400);
   }
 
   function patch(id: string, fn: (c: Conv) => Conv, immediate = false) {
@@ -390,9 +398,11 @@ export default function App() {
 
   /** 切走之前立刻落盘，别把最后 400ms 的输入丢在 debounce 里 */
   function flushConv(id: string): Promise<void> {
-    const conv = convsRef.current.find((c) => c.id === id);
-    if (!conv) return Promise.resolve();
     clearTimeout(saveTimers.current[id]);
+    delete saveTimers.current[id];
+
+    const conv = convsRef.current.find((c) => c.id === id);
+    if (!conv || deletedRef.current.has(id)) return Promise.resolve();
     return putConv(conv).catch(() => {});
   }
 
@@ -459,7 +469,13 @@ export default function App() {
           ...m,
           tools: (m.tools || []).map((t) =>
             t.id === e.callId
-              ? { ...t, result: e.result, status: 'done', finishedAt: e.at || Date.now() }
+              ? {
+                  ...t,
+                  result: e.result,
+                  status: e.ok === false ? ('error' as const) : ('done' as const),
+                  finishedAt: e.at || Date.now(),
+                  interrupted: false,
+                }
               : t
           ),
         }));
@@ -467,7 +483,22 @@ export default function App() {
         return touch((m) => ({ ...m, usage: e.usage }));
       case 'error':
         return {
-          ...touch((m) => ({ ...m, error: e.message, pending: false })),
+          ...touch((m) => ({
+            ...m,
+            error: e.message,
+            pending: false,
+            // 运行级错误（例如模型 500）也要收尾，避免工具卡片永远停在“执行中”
+            tools: (m.tools || []).map((t) =>
+              t.status === 'running'
+                ? {
+                    ...t,
+                    status: 'error' as const,
+                    result: t.result || '执行中断',
+                    finishedAt: Date.now(),
+                  }
+                : t
+            ),
+          })),
           runId: undefined,
         };
       case 'done':
@@ -476,7 +507,25 @@ export default function App() {
           lastEventId: e.id > 0 ? e.id : c.lastEventId,
           runId: undefined,
           updatedAt: Date.now(),
-          messages: c.messages.map((m) => (m.id === msgId ? { ...m, pending: false } : m)),
+          messages: c.messages.map((m) =>
+            m.id === msgId
+              ? {
+                  ...m,
+                  pending: false,
+                  // 兜底：正常流程工具都会先收到 tool_result；万一没收到也不能卡住
+                  tools: (m.tools || []).map((t) =>
+                    t.status === 'running'
+                      ? {
+                          ...t,
+                          status: 'error' as const,
+                          result: t.result || '工具未返回结果',
+                          finishedAt: Date.now(),
+                        }
+                      : t
+                  ),
+                }
+              : m
+          ),
         };
       default:
         return c;
@@ -529,7 +578,8 @@ export default function App() {
     const text = input.trim();
     // sendingRef 挡住 POST 返回前（busy 还没置 true）的第二次点击/Enter
     if (!text || !current || busy || offline || sendingRef.current) return;
-    sendingRef.current = true;
+    const seq = ++sendSeqRef.current;
+    sendingRef.current = seq;
 
     const userMsg: Msg = { id: uid(), role: 'user', content: text, createdAt: Date.now() };
     const botMsg: Msg = {
@@ -581,6 +631,12 @@ export default function App() {
         useImage: settings.useImage,
       });
 
+      if (!convsRef.current.some((c) => c.id === convId)) {
+        // 会话在 POST 期间被删了：服务端 run 已经没人接，顺手取消，别白烧 token
+        api.cancel(res.runId).catch(() => {});
+        return;
+      }
+
       if (res.sources?.length) {
         patchMsg(convId, botMsg.id, (m) => ({ ...m, sources: res.sources }));
       }
@@ -596,9 +652,11 @@ export default function App() {
         setGateError('访问码已失效，请重新输入');
       }
       patchMsg(convId, botMsg.id, (m) => ({ ...m, error: e.message, pending: false }), true);
-      setBusy(false);
+      // 迟到的失败不能关掉别的会话正在进行的 busy
+      if (currentIdRef.current === convId && sendingRef.current === seq) setBusy(false);
     } finally {
-      sendingRef.current = false;
+      // A 的请求返回时 B 可能已经在发，只清自己这把锁
+      if (sendingRef.current === seq) sendingRef.current = 0;
     }
   }
 
@@ -609,6 +667,8 @@ export default function App() {
     esRef.current?.close();
     esRef.current = null;
     setBusy(false);
+    // 停流后允许立刻再发一条（POST 已返回才会走到这里，重置无副作用）
+    sendingRef.current = 0;
 
     // 取消后服务端不会再补 done，必须在这里收尾：
     // 否则 content 还是空的 assistant 消息会一直渲染三个点
@@ -620,7 +680,23 @@ export default function App() {
         lastEventId: undefined,
         updatedAt: Date.now(),
         messages: c.messages.map((m) =>
-          m.role === 'assistant' && m.pending ? { ...m, pending: false, stopped: true } : m
+          m.role === 'assistant'
+            ? {
+                ...m,
+                ...(m.pending ? { pending: false, stopped: true } : {}),
+                tools: (m.tools || []).map((t) =>
+                  t.status === 'running'
+                    ? {
+                        ...t,
+                        status: 'error' as const,
+                        interrupted: true,
+                        result: t.result || '已中断',
+                        finishedAt: Date.now(),
+                      }
+                    : t
+                ),
+              }
+            : m
         ),
       }),
       true
@@ -651,11 +727,8 @@ export default function App() {
     putConv(c).catch(() => {});
   }
 
-  function onSelect(id: string) {
-    if (currentId && currentId !== id) flushConv(currentId);
-    setSidebarOpen(false);
-    esRef.current?.close();
-    setBusy(false);
+  /** 切到某个会话：恢复它的草稿、设置，并接回还没结束的流 */
+  function activateConv(c: Conv) {
     speechBase.current = '';
     speechSession.current += 1;
     speechConvRef.current = '';
@@ -663,40 +736,69 @@ export default function App() {
     setHistIdx(-1);
     stickRef.current = true;
     setShowJump(false);
-    const c = convsRef.current.find((x) => x.id === id);
-    setInput(c?.draft || '');
-    // 每个会话保存了自己的设置，切回来时要恢复，避免沿用上一个会话的开关
-    if (c?.settings) setSettings(c.settings);
-    setCurrentId(id);
-    currentIdRef.current = id;
-    kvSet(`currentId:${config?.tenant || 'public'}`, id);
+
+    setInput(c.draft || '');
+    // 每个会话保存了自己的设置，切过去时要恢复，避免沿用上一个会话的开关
+    if (c.settings) setSettings(c.settings);
+
+    setCurrentId(c.id);
+    currentIdRef.current = c.id;
+    kvSet(`currentId:${config?.tenant || 'public'}`, c.id);
+
     // 离线时先不接流，等 online 事件统一恢复；否则 EventSource 会连续失败并误报“记录过期”
-    if (c?.runId && !offline) resume(c);
+    if (c.runId && !offline) resume(c);
+  }
+
+  function onSelect(id: string) {
+    if (currentId && currentId !== id) flushConv(currentId);
+    setSidebarOpen(false);
+    esRef.current?.close();
+    esRef.current = null;
+    setBusy(false);
+
+    const c = convsRef.current.find((x) => x.id === id);
+    if (!c) return;
+    activateConv(c);
   }
 
   async function onDelete(id: string) {
-    esRef.current?.close();
+    const isCurrent = id === currentIdRef.current;
     const target = convsRef.current.find((c) => c.id === id);
+
+    // 只取消被删会话自己的 run；当前会话的 SSE 不能因为删别的会话被关掉
     if (target?.runId) api.cancel(target.runId).catch(() => {});
-    await delConv(id);
-    const rest = convsRef.current.filter((c) => c.id !== id);
-    setConvs(rest);
-    convsRef.current = rest;
-    if (currentId === id) {
-      speechBase.current = '';
-      speechSession.current += 1;
-      speechConvRef.current = '';
-      recRef.current?.stop();
-      setHistIdx(-1);
-      const next = rest[0] || newConv(settings, config?.tenant || 'public');
-      setConvs(rest.length ? rest : [next]);
-      convsRef.current = rest.length ? rest : [next];
-      setCurrentId(next.id);
-      currentIdRef.current = next.id;
-      setInput(next.draft || '');
-      kvSet(`currentId:${config?.tenant || 'public'}`, next.id);
-      if (!rest.length) putConv(next).catch(() => {});
+
+    // 顺序很重要：先掐掉 400ms debounce，再打墓碑，最后才删
+    clearTimeout(saveTimers.current[id]);
+    delete saveTimers.current[id];
+    deletedRef.current.add(id);
+
+    if (isCurrent) {
+      esRef.current?.close();
+      esRef.current = null;
+      setBusy(false);
+      // 只放开被删会话的发送锁；它那个 POST 返回时不会影响下一条会话
+      sendingRef.current = 0;
     }
+
+    await delConv(id);
+
+    const rest = convsRef.current.filter((c) => c.id !== id);
+    convsRef.current = rest;
+    setConvs(rest);
+
+    // 删的不是当前会话：当前流、输入框、busy 都不动
+    if (!isCurrent) return;
+
+    const next = rest[0] || newConv(settings, config?.tenant || 'public');
+    if (!rest.length) {
+      convsRef.current = [next];
+      setConvs([next]);
+      putConv(next).catch(() => {});
+    }
+
+    // 和手动切会话走同一条路径：恢复设置、草稿，并 resume 下一条还在跑的 run
+    activateConv(next);
   }
 
   function updateSettings(s: Settings) {

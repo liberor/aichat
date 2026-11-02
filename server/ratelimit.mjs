@@ -83,6 +83,24 @@ export function authLimit(req, res, next) {
   next();
 }
 
+/**
+ * 当前 IP 是否处于访问码锁定中，返回剩余秒数（0 = 未锁定）。
+ * X-Access-Code 头和 /api/auth 共用同一张失败表，任何一个入口试错都会锁同一 IP。
+ */
+export function authRetryAfter(ip) {
+  const now = Date.now();
+
+  if (authFails.size > 1000) {
+    for (const [key, v] of authFails) {
+      if (v.reset < now) authFails.delete(key);
+    }
+  }
+
+  const bucket = authFails.get(ip);
+  if (!bucket?.blockedUntil || bucket.blockedUntil <= now) return 0;
+  return Math.ceil((bucket.blockedUntil - now) / 1000);
+}
+
 export function noteAuthFailure(ip) {
   const now = Date.now();
   const windowMs = config.authLockMinutes * 60 * 1000;

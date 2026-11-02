@@ -102,8 +102,12 @@ function ToolCard({ tool }: { tool: ToolCall }) {
         {running ? (
           <span className="tool-status running">{elapsed ? `执行中 ${elapsed}` : '执行中…'}</span>
         ) : (
-          <span className="tool-status">
-            {tool.status === 'error' ? '失败' : `完成${elapsed ? ` · 用时 ${elapsed}` : ''}`}
+          <span className={`tool-status ${tool.status}`}>
+            {tool.interrupted
+              ? '已中断'
+              : tool.status === 'error'
+                ? '失败'
+                : `完成${elapsed ? ` · 用时 ${elapsed}` : ''}`}
           </span>
         )}
       </div>

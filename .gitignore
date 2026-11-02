@@ -42,3 +42,6 @@ Thumbs.db
 desktop.ini
 *.swp
 *~
+
+/BACKEND.md
+/FRONTEND.md

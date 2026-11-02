@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { streamChat } from './llm.mjs';
 import { executeTool } from './tools.mjs';
+import { validateToolArgs } from './tool-schema.mjs';
 
 const runs = new Map();
 const TTL = 30 * 60 * 1000;
@@ -141,6 +142,12 @@ async function execute(run, { provider, model, messages, tools, apiKey, mock, te
   const MAX_STEPS = 6;
   // 本次 run 在 POST 时快照下来的工具白名单：没声明过的工具一律不执行
   const allowed = new Set((tools || []).map((t) => t?.function?.name).filter(Boolean));
+  // 工具名 -> JSON Schema，执行前用 AJV 校验参数
+  const schemaByName = new Map(
+    (tools || [])
+      .filter((t) => t?.function?.name && t?.function?.parameters)
+      .map((t) => [t.function.name, t.function.parameters])
+  );
 
   for (let step = 0; step < MAX_STEPS; step++) {
     if (run.abort.signal.aborted) return;
@@ -206,18 +213,33 @@ async function execute(run, { provider, model, messages, tools, apiKey, mock, te
       emit(run, { type: 'tool_call', callId: call.id, name: call.function.name, args, at: Date.now() });
 
       let result;
+      let ok = true;
       if (!allowed.has(call.function.name)) {
         result = `工具未启用: ${call.function.name}`;
+        ok = false;
       } else {
-        try {
-          result = await executeTool(tenant, call.function.name, args, { signal: run.abort.signal });
-        } catch (err) {
-          // 用户取消：不要包装成工具失败，让 createRun 的 catch 静默结束
-          if (err?.name === 'AbortError' || run.abort.signal.aborted) throw err;
-          result = `工具执行失败: ${err.message}`;
+        const schema = schemaByName.get(call.function.name);
+        const check = schema
+          ? validateToolArgs(call.function.name, schema, args)
+          : { ok: true, args };
+
+        if (!check.ok) {
+          // 参数不合法时不要执行工具，把错误作为 tool_result 回填给模型修正
+          result = `参数不合法: ${check.error}`;
+          ok = false;
+        } else {
+          args = check.args;
+          try {
+            result = await executeTool(tenant, call.function.name, args, { signal: run.abort.signal });
+          } catch (err) {
+            // 用户取消：不要包装成工具失败，让 createRun 的 catch 静默结束
+            if (err?.name === 'AbortError' || run.abort.signal.aborted) throw err;
+            result = `工具执行失败: ${err.message}`;
+            ok = false;
+          }
         }
       }
-      emit(run, { type: 'tool_result', callId: call.id, name: call.function.name, result, at: Date.now() });
+      emit(run, { type: 'tool_result', callId: call.id, name: call.function.name, ok, result, at: Date.now() });
 
       convo.push({ role: 'tool', tool_call_id: call.id, content: String(result) });
     }

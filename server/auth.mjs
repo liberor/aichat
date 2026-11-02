@@ -1,6 +1,6 @@
 import crypto from 'node:crypto';
 import { config } from './config.mjs';
-import { noteAuthFailure, clearAuthFailures } from './ratelimit.mjs';
+import { noteAuthFailure, clearAuthFailures, authRetryAfter } from './ratelimit.mjs';
 
 /**
  * 会话：token -> { tenant, exp, keys }
@@ -106,6 +106,14 @@ export function logout(req, res) {
   res.json({ ok: true });
 }
 
+function limited(res, secs) {
+  res.set('Retry-After', String(secs));
+  return res.status(429).json({
+    error: `访问码尝试次数过多，请在 ${Math.ceil(secs / 60)} 分钟后重试`,
+    code: 'auth_limited',
+  });
+}
+
 export function requireAccess(req, res, next) {
   const session = getSession(req);
   req.session = session || null;
@@ -121,11 +129,28 @@ export function requireAccess(req, res, next) {
   }
 
   const header = req.headers['x-access-code'];
-  const headerMatch = header && config.accessCodes.find((c) => safeEqual(header, c));
-  if (headerMatch) {
-    req.tenant = tenantFor(headerMatch);
+
+  // 没带头的普通未登录请求不计失败，否则 cookie 过期会把正常用户锁死
+  if (!header) {
+    return res.status(401).json({ error: '需要访问码', code: 'unauthorized' });
+  }
+
+  const ip = req.ip || req.socket.remoteAddress || 'unknown';
+
+  // 和 /api/auth 共用失败计数：header 方式不能绕过锁定
+  const lockedFor = authRetryAfter(ip);
+  if (lockedFor) return limited(res, lockedFor);
+
+  const matched = config.accessCodes.find((c) => safeEqual(header, c));
+  if (matched) {
+    clearAuthFailures(ip);
+    req.tenant = tenantFor(matched);
     return next();
   }
 
-  return res.status(401).json({ error: '需要访问码', code: 'unauthorized' });
+  const bucket = noteAuthFailure(ip);
+  const left = bucket.blockedUntil - Date.now();
+  if (left > 0) return limited(res, Math.ceil(left / 1000));
+
+  return res.status(401).json({ error: '访问码不正确', code: 'bad_code' });
 }

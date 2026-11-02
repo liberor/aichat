@@ -112,7 +112,7 @@ export const api = {
 export type StreamEvent =
   | { id: number; type: 'delta'; text: string }
   | { id: number; type: 'tool_call'; callId: string; name: string; args: unknown; at?: number }
-  | { id: number; type: 'tool_result'; callId: string; name: string; result: string; at?: number }
+  | { id: number; type: 'tool_result'; callId: string; name: string; ok?: boolean; result: string; at?: number }
   | { id: number; type: 'usage'; usage: { prompt_tokens?: number; completion_tokens?: number } }
   | { id: number; type: 'error'; message: string }
   | { id: number; type: 'done' };
